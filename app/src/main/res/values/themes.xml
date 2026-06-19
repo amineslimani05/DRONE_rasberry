@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Thème de base utilisant Material3 pour assurer la compatibilité avec Jetpack Compose au démarrage -->
+    <style name="Theme.DRONE_rasberry" parent="Theme.Material3.DayNight.NoActionBar" />
+</resources>
