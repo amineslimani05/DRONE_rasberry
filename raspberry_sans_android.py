@@ -6,116 +6,177 @@ import glob
 from pymavlink import mavutil
 
 # ==============================================================================
-# 1. INITIALISATION DE LA LIAISON SÉRIE AVEC LE DRONE (PX4)
+# 1. CONFIGURATION DU MATÉRIEL SÉRIE
 # ==============================================================================
-def rechercher_port_actif():
-    """Recherche dynamique du port USB connecté au contrôleur de vol."""
-    liste_ports = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
-    if not liste_ports:
-        print("[ERREUR] Aucun drone détecté. Vérifier la connexion USB.")
+def obtenir_port_actif():
+    """Scanne les interfaces matérielles disponibles pour valider la liaison MAVLink."""
+    liste_peripheriques = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
+    if not liste_peripheriques:
+        print("[ERREUR] Absence de connexion matérielle détectée.")
         sys.exit()
-    return liste_ports[0]
-
-port_serie_drone = rechercher_port_actif()
-vitesse_transmission = 115200
-
-print(f"[SÉRIE] Connexion au drone sur {port_serie_drone}...")
-try:
-    liaison_drone = mavutil.mavlink_connection(port_serie_drone, baud=vitesse_transmission)
-    liaison_drone.wait_heartbeat()
-    print("[SÉRIE] Drone connecté et Heartbeat reçu !")
-except Exception as erreur_liaison:
-    print(f"[ERREUR] Impossible d'ouvrir le port série : {erreur_liaison}")
+    
+    for peripherique in liste_peripheriques:
+        try:
+            liaison = mavutil.mavlink_connection(peripherique, baud=115200)
+            signal = liaison.wait_heartbeat(timeout=2)
+            if signal is not None:
+                return liaison, peripherique
+        except Exception:
+            pass
+    print("[ERREUR] Aucun port MAVLink valide (Console NuttX interceptée).")
     sys.exit()
 
-# Passage forcé en mode STABILIZED au démarrage pour accepter les commandes manuelles
-print("[SÉRIE] Configuration initiale du mode de vol sur STABILIZED...")
-liaison_drone.mav.command_long_send(
-    liaison_drone.target_system, liaison_drone.target_component,
-    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-    1, 1, 0, 0, 0, 0, 0
+liaison_vol, port_connexion = obtenir_port_actif()
+print(f"[MATÉRIEL] Synchronisation MAVLink établie sur {port_connexion}.")
+
+# ==============================================================================
+# 2. PHASE DE CHAUFFE (WARM-UP) ET ACTIVATION DU MODE
+# ==============================================================================
+print("[SYSTÈME] Génération du signal pilote virtuel (Phase de chauffe)...")
+
+# Envoi de 15 paquets neutres (1.5s) pour satisfaire la sécurité RC Loss de PX4
+for _ in range(15):
+    liaison_vol.mav.manual_control_send(
+        liaison_vol.target_system, 0, 0, 0, 0, 0
+    )
+    time.sleep(0.1)
+
+print("[MATÉRIEL] Signal validé. Activation du mode STABILIZED...")
+liaison_vol.mav.command_long_send(
+    liaison_vol.target_system, liaison_vol.target_component,
+    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, 1, 1, 0, 0, 0, 0, 0
 )
 time.sleep(1)
 
 # ==============================================================================
-# 2. INITIALISATION DU SERVEUR UDP (Écoute des commandes Android)
+# 3. CONFIGURATION DU RÉSEAU (UDP NON BLOQUANT)
 # ==============================================================================
-adresse_ecoute = "0.0.0.0" # Écoute sur toutes les interfaces réseau du Raspberry
-port_ecoute = 14550
+port_reception = 14550
+relais_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-serveur_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# Délai maximal d'attente réseau fixé à 100 millisecondes (Maintien de la boucle à 10Hz)
+relais_udp.settimeout(0.1)
+
 try:
-    serveur_udp.bind((adresse_ecoute, port_ecoute))
-    print(f"[RÉSEAU] Serveur UDP démarré. En attente de paquets sur le port {port_ecoute}...\n")
-except Exception as erreur_reseau:
-    print(f"[ERREUR] Impossible de lier le port UDP : {erreur_reseau}")
+    relais_udp.bind(("0.0.0.0", port_reception))
+    print(f"[RÉSEAU] Écoute active sur le port {port_reception}.")
+except Exception as erreur_liaison:
+    print(f"[ERREUR] Conflit d'adresse réseau : {erreur_liaison}. (Libérer avec fuser -k)")
     sys.exit()
 
 # ==============================================================================
-# 3. BOUCLE PRINCIPALE DE RÉCEPTION ET CONVERSION
+# 4. VARIABLES DE MÉMOIRE D'ÉTAT ET FILTRES ALTIMÉTRIQUES
+# ==============================================================================
+# Mémoire du pilotage
+memoire_axe_x = 0
+memoire_axe_y = 0
+memoire_axe_z = 0
+memoire_axe_r = 0
+temps_dernier_armement = 0
+
+# Variables pour le filtre et le tarage de l'altitude
+historique_altitude = []
+taille_echantillon = 10
+altitude_reference = None
+
+print("[SYSTÈME] Boucle de maintien rythmée à 10 Hz démarrée.\n")
+
+# ==============================================================================
+# 5. BOUCLE DE TRAITEMENT CONTINU
 # ==============================================================================
 try:
     while True:
-        # Attente bloquante d'un paquet UDP venant d'Android
-        donnees_brutes, adresse_client = serveur_udp.recvfrom(1024)
-        chaine_json = donnees_brutes.decode('utf-8')
-        
+        # --- LECTURE RÉSEAU ---
         try:
-            # Extraction du dictionnaire à partir de la chaîne JSON
-            commande_recue = json.loads(chaine_json)
-            type_paquet = commande_recue.get("mavpackettype")
+            # Tampon de 4096 octets pour prévenir la fragmentation JSON
+            donnees_entrantes, adresse_emetteur = relais_udp.recvfrom(4096)
+            chaine_texte = donnees_entrantes.decode('utf-8')
+            
+            dictionnaire_commande = json.loads(chaine_texte)
+            categorie_message = dictionnaire_commande.get("mavpackettype")
 
-            # ------------------------------------------------------------------
-            # CAS A : Commande d'armement ou désarmement (COMMAND_LONG)
-            # ------------------------------------------------------------------
-            if type_paquet == "COMMAND_LONG":
-                code_commande = int(commande_recue.get("command", 0))
-                parametre_1 = float(commande_recue.get("param1", 0.0))
-                
-                # INJECTION DE SÉCURITÉ : Forçage de l'armement (21196) côté serveur
-                parametre_2 = 21196 if code_commande == 400 else 0.0
-                
-                print(f"[RÉSEAU -> SÉRIE] Ordre d'armement reçu : Param1={parametre_1}")
-                
-                liaison_drone.mav.command_long_send(
-                    liaison_drone.target_system,
-                    liaison_drone.target_component,
-                    code_commande,
-                    0,              # Confirmation
-                    parametre_1,    # 1 = Armer, 0 = Désarmer
-                    parametre_2,    # 21196 pour forcer
-                    0, 0, 0, 0, 0
-                )
+            # --- GESTION DE L'ARMEMENT ---
+            if categorie_message == "COMMAND_LONG":
+                temps_actuel = time.time()
+                # Filtre anti-spam : 1 seconde de carence
+                if temps_actuel - temps_dernier_armement > 1.0:
+                    instruction = int(dictionnaire_commande.get("command", 0))
+                    argument_1 = float(dictionnaire_commande.get("param1", 0.0))
+                    argument_2 = 21196 if instruction == 400 else 0.0
+                    
+                    if instruction == 400:
+                        if argument_1 == 1.0:
+                            # Revalidation du mode STABILIZED avant réarmement
+                            print("\n[SÉCURITÉ] Confirmation du mode STABILIZED avant armement...")
+                            liaison_vol.mav.command_long_send(
+                                liaison_vol.target_system, liaison_vol.target_component,
+                                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, 1, 1, 0, 0, 0, 0, 0
+                            )
+                            time.sleep(0.1)
+                            print("[ACTION] Transmission de l'ordre d'ARMEMENT.")
+                        else:
+                            # Nettoyage de sécurité : annulation de la poussée au désarmement
+                            memoire_axe_z = 0
+                            print("\n[ACTION] DÉSARMEMENT : Verrouillage des gaz à 0.")
 
-            # ------------------------------------------------------------------
-            # CAS B : Commande de pilotage manuel (MANUAL_CONTROL)
-            elif type_paquet == "MANUAL_CONTROL":
-                valeur_x = int(commande_recue.get("x", 0))
-                valeur_y = int(commande_recue.get("y", 0))
-                valeur_z = int(commande_recue.get("z", 0))
-                valeur_r = int(commande_recue.get("r", 0))
-                
-                # --- LIGNE À AJOUTER POUR L'AFFICHAGE ---
-                print(f"[JOYSTICK] Tangage(X): {valeur_x:4d} | Roulis(Y): {valeur_y:4d} | Gaz(Z): {valeur_z:4d}")
-                
-                liaison_drone.mav.manual_control_send(
-                    liaison_drone.target_system,
-                    valeur_x,
-                    valeur_y,
-                    valeur_z,
-                    valeur_r,
-                    0               # Boutons non utilisés
-                )
-                
-            else:
-                print(f"[ATTENTION] Type de paquet inconnu : {type_paquet}")
+                    liaison_vol.mav.command_long_send(
+                        liaison_vol.target_system, liaison_vol.target_component,
+                        instruction, 0, argument_1, argument_2, 0, 0, 0, 0, 0
+                    )
+                    temps_dernier_armement = temps_actuel
+                    time.sleep(0.2)
 
-            print(type_paquet)
+            # --- GESTION DU PILOTAGE ---
+            elif categorie_message == "MANUAL_CONTROL":
+                memoire_axe_x = int(dictionnaire_commande.get("x", 0))
+                memoire_axe_y = int(dictionnaire_commande.get("y", 0))
+                memoire_axe_z = int(dictionnaire_commande.get("z", 0))
+                memoire_axe_r = int(dictionnaire_commande.get("r", 0))
 
+        except socket.timeout:
+            pass  # Le réseau est vide, la boucle continue
         except json.JSONDecodeError:
-            print(f"[ERREUR] Trame UDP corrompue ou JSON invalide : {chaine_json}")
+            pass  # Trame altérée ignorée
+
+        # --- ÉMISSION MAVLINK PERMANENTE ---
+        # Garantit que la carte de vol reçoit toujours un signal
+        liaison_vol.mav.manual_control_send(
+            liaison_vol.target_system,
+            memoire_axe_x,
+            memoire_axe_y,
+            memoire_axe_z,
+            memoire_axe_r,
+            0
+        )
+
+        # --- RÉCEPTION TÉLÉMÉTRIE ET TARAGE ALTIMÉTRIQUE ---
+        donnees_vol = liaison_vol.recv_match(type='VFR_HUD', blocking=False)
+
+        if donnees_vol:
+            altitude_brute = donnees_vol.alt
+            historique_altitude.append(altitude_brute)
+
+            # Maintien de la taille du tampon
+            if len(historique_altitude) > taille_echantillon:
+                historique_altitude.pop(0)
+
+            # Moyenne mobile
+            altitude_lissee_absolue = sum(historique_altitude) / len(historique_altitude)
+
+            # Calibrage du zéro initial une fois le tampon rempli
+            if len(historique_altitude) == taille_echantillon and altitude_reference is None:
+                altitude_reference = altitude_lissee_absolue
+                print(f"\n[SYSTÈME] Altitude de référence fixée à : {altitude_reference:.2f} m\n")
+
+            # Affichage de la position par rapport au point zéro
+            if altitude_reference is not None:
+                altitude_relative = altitude_lissee_absolue - altitude_reference
+                
+                # Impression formatée effaçant la ligne précédente pour une lecture propre
+                sys.stdout.write(f"\r[TÉLÉMÉTRIE] Alt relative: {altitude_relative:+05.2f} m | Gaz(Z): {memoire_axe_z:4d} | Roulis/Tangage: {memoire_axe_x:4d}/{memoire_axe_y:4d}    ")
+                sys.stdout.flush()
 
 except KeyboardInterrupt:
-    print("\n[SYSTÈME] Arrêt du serveur relais. Fermeture des ports.")
-    serveur_udp.close()
+    print("\n\n[SYSTÈME] Arrêt manuel. Libération des ressources.")
+    relais_udp.close()
     sys.exit()
